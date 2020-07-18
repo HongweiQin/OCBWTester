@@ -7,9 +7,26 @@
 #include <linux/bitmap.h>
 #include <linux/proc_fs.h>
 
+#define OCBWT_SUBMIT_QD (16)
+#define OCBWT_BIO_NRVEC (8)
+#define OCBWT_BIOPAGE_ALLOC_ORDER (3)
+#define OCBWT_BIOPAGE_NUM (1 << OCBWT_BIOPAGE_ALLOC_ORDER)
+
 enum {
 	OCBWT_UNINITIALIZED = 0,
 	OCBWT_INITIALIZED,
+};
+
+#define ocmbt_dma_meta_size (sizeof(unsigned long) * 128)
+
+
+struct ocbwt_global_status {
+	unsigned long nr_chnls;
+};
+
+struct ocbwt_pch_status {
+	unsigned long inflight;
+	unsigned long finished;
 };
 
 struct per_writer_info {
@@ -22,7 +39,13 @@ struct per_writer_info {
 	volatile int running_state;
 
 	/* Variables that used by the writer. */
-	atomic64_t counter;
+	atomic64_t finish_counter;
+	atomic_t inflight_requests;
+	int c_lun;
+	int c_pln;
+	int c_blk;
+	int c_pg;
+	int c_sec;
 };
 
 struct ocbw_tester {
@@ -31,31 +54,230 @@ struct ocbw_tester {
 	unsigned int oc_channels;
 	int nr_luns;
 	int nr_planes;
+	int nr_blks;
+	int pgs_per_blk;
+	int sec_per_page;
+	int plane_mode;
 	struct per_writer_info *pwi;
+	unsigned int status_size;
 };
 
+struct ocbw_tester *global_tester;
+
+static struct ppa_addr ocbwt_calculate_ppa(struct ocbw_tester *tester,
+									struct per_writer_info *wi)
+{
+	struct ppa_addr ppa = {.ppa=0};
+
+	ppa.g.blk = wi->c_blk;
+	ppa.g.pg = wi->c_pg;
+	ppa.g.sec = wi->c_sec;
+	ppa.g.pl = wi->c_pln;
+	ppa.g.lun = wi->c_lun;
+	ppa.g.ch = wi->writer_index;
+
+	wi->c_sec++;
+	if (wi->c_sec == tester->sec_per_page) {
+		wi->c_sec = 0;
+		wi->c_pln++;
+		if (wi->c_pln == tester->nr_planes) {
+			wi->c_pln = 0;
+			wi->c_lun++;
+			if (wi->c_lun == tester->nr_luns) {
+				wi->c_lun = 0;
+				wi->c_pg++;
+				if (wi->c_pg == tester->pgs_per_blk) {
+					wi->c_pg = 0;
+					wi->c_blk++;
+					if (wi->c_blk == tester->nr_blks)
+						wi->c_blk = 0;
+				}
+			}
+		}
+	}
+	return ppa;
+}
+
+static void ocbwt_end_io_write(struct nvm_rq *rqd)
+{
+	struct per_writer_info *wi = rqd->private;
+	struct bio *bio = rqd->bio;
+
+	if (rqd->error) {
+		pr_err("Write error\n");
+	}
+
+	//pr_notice("Finish rqd wi %u\n", wi->writer_index);
+	atomic64_inc(&wi->finish_counter);
+	atomic_dec(&wi->inflight_requests);
+
+	nvm_dev_dma_free(wi->ocbwt->dev->parent, rqd->meta_list, rqd->dma_meta_list);
+	kfree(rqd);
+	__free_pages(bio_first_page_all(bio), OCBWT_BIOPAGE_ALLOC_ORDER);
+	bio_put(bio);
+}
+
+static int ocbwt_issue_write_nowait(struct per_writer_info *wi)
+{
+	struct nvm_rq *rqd;
+	struct bio *bio;
+	int ret;
+	struct page *pages;
+	int i;
+	unsigned long pfn;
+	struct page *page;
+	struct ocbw_tester *tester = wi->ocbwt;
+
+	bio = bio_alloc(GFP_ATOMIC, OCBWT_BIO_NRVEC);
+	if (!bio)
+		return -ENOMEM;
+
+	bio->bi_iter.bi_sector = 0; /* internal bio */
+	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+
+	pages = alloc_pages(GFP_ATOMIC, OCBWT_BIOPAGE_ALLOC_ORDER);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto outPutBIO;
+	}
+		
+	pfn = page_to_pfn(pages);
+	for (i = 0; i < OCBWT_BIOPAGE_NUM; i++) {
+		page = pfn_to_page(pfn);
+		bio_add_page(bio, page, PAGE_SIZE, 0);
+		pfn++;
+	}
+
+	rqd = kmalloc(sizeof(*rqd), GFP_ATOMIC);
+	if (unlikely(!rqd)) {
+		ret = -ENOMEM;
+		goto outFreePages;
+	}
+
+	rqd->bio = bio;
+	rqd->dev = tester->dev;
+	rqd->opcode = NVM_OP_PWRITE;
+	rqd->nr_ppas = OCBWT_BIOPAGE_NUM;
+	rqd->flags = (tester->plane_mode >> 1) | NVM_IO_SCRAMBLE_ENABLE;
+
+	rqd->private = wi;
+	rqd->end_io = ocbwt_end_io_write;
+
+	rqd->meta_list = nvm_dev_dma_alloc(tester->dev->parent, GFP_ATOMIC,
+							&rqd->dma_meta_list);
+	if (!rqd->meta_list) {
+		ret = -ENOMEM;
+		goto outFreeRQD;
+	}
+
+	rqd->ppa_list = rqd->meta_list + ocmbt_dma_meta_size;
+	rqd->dma_ppa_list = rqd->dma_meta_list + ocmbt_dma_meta_size;
+	rqd->ppa_status = rqd->error = 0;
+
+	for (i = 0; i < OCBWT_BIOPAGE_NUM; i++)
+		rqd->ppa_list[i] = ocbwt_calculate_ppa(tester, wi);
+
+	//pr_notice("%s, ch[%u] ppa=0x%llx\n",
+	//		__func__, wi->writer_index, rqd->ppa_list[0].ppa);
+
+	return nvm_submit_io(tester->dev, rqd);
+
+	nvm_dev_dma_free(tester->dev->parent, rqd->meta_list, rqd->dma_meta_list);
+outFreeRQD:
+	kfree(rqd);
+outFreePages:
+	__free_pages(pages, OCBWT_BIOPAGE_ALLOC_ORDER);
+outPutBIO:
+	bio_put(bio);
+	return ret;
+}
 
 static int ocbwt_writer_fn(void *data)
 {
 	struct per_writer_info *wi = data;
-	unsigned int writer_index = wi->writer_index;
 
-	atomic64_set(&wi->counter, 0);
-	pr_notice("Writer %u initialized\n", writer_index);
+	atomic64_set(&wi->finish_counter, 0);
+	atomic_set(&wi->inflight_requests, 0);
+	wi->c_blk = wi->c_lun = wi->c_pg = wi->c_pln = wi->c_sec = 0;
+	//pr_notice("Writer %u initialized\n", wi->writer_index);
 	smp_store_release(&wi->running_state, OCBWT_INITIALIZED);
-	
+	set_current_state(TASK_INTERRUPTIBLE);
+	schedule();
+
 	while (!kthread_should_stop()) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
+		if (atomic_add_unless(&wi->inflight_requests, 1, OCBWT_SUBMIT_QD))
+			ocbwt_issue_write_nowait(wi);
+		else
+			schedule();
 	}
-	pr_notice("Writer %u exit\n", writer_index);
+	//pr_notice("Writer %u exit\n", wi->writer_index);
 	return 0;
 }
 
+static ssize_t ocbwt_proc_write(struct file *file,
+						const char __user *buffer,
+						size_t count, loff_t *ppos)
+{
+	char usrCommand[512];
+	struct ocbw_tester *tester = global_tester;
+	int ret;
+	unsigned int nr_chnls = tester->oc_channels;
+	int i;
+
+	ret = copy_from_user(usrCommand, buffer, count);
+	switch(usrCommand[0]) {
+	case 'g':
+		for (i = 0; i < nr_chnls; i++)
+			wake_up_process(tester->pwi[i].writer_ts);
+		break;
+	}
+
+	return count;
+}
+
+static void ocbwt_fill_status(struct ocbw_tester *tester, void *ocbwt_status)
+{
+	struct ocbwt_global_status *gs = ocbwt_status;
+	struct ocbwt_pch_status *ch_array = ocbwt_status + sizeof(struct ocbwt_global_status);
+	struct ocbwt_pch_status *cs;
+	unsigned int i, nr_chnls;
+	struct per_writer_info *wi;
+
+	nr_chnls = gs->nr_chnls = tester->oc_channels;
+	for (i = 0; i < nr_chnls; i++) {
+		cs = &ch_array[i];
+		wi = &tester->pwi[i];
+		cs->finished = atomic64_read(&wi->finish_counter);
+		cs->inflight = atomic_read(&wi->inflight_requests);
+	}
+}
+
+static ssize_t ocbwt_proc_read(struct file *file, char __user *buffer, size_t count, loff_t *ppos)
+{
+	struct ocbw_tester *tester = global_tester;
+	unsigned int status_size = global_tester->status_size;
+	void *ocbwt_status;
+	int ret;
+
+	ocbwt_status = kmalloc(status_size, GFP_KERNEL);
+	if (!ocbwt_status)
+		return 0;
+
+	ocbwt_fill_status(tester, ocbwt_status);
+	if (count >= status_size)
+		ret = copy_to_user(buffer, ocbwt_status, status_size);
+	else
+		ret = copy_to_user(buffer, ocbwt_status, count);
+	kfree(ocbwt_status);
+	if (ret)
+		return EFAULT;
+	return (count >= status_size)?status_size:count;
+}
 
 static const struct file_operations ocbwt_proc_fops = {
   .owner = THIS_MODULE,
-  //.write = rGen_write,
+  .write = ocbwt_proc_write,
+  .read = ocbwt_proc_read,
 };
 
 
@@ -94,7 +316,8 @@ static void *tester_init(struct nvm_tgt_dev *dev, struct gendisk **ptdisk,
 		return ERR_PTR(-ENOMEM);	
 
 	strlcpy(fake_disk->disk_name, create->tgtname, sizeof(fake_disk->disk_name));
-	fake_disk->private_data = tester = kzalloc(sizeof(*tester), GFP_KERNEL);
+	fake_disk->private_data = tester = global_tester =
+						kzalloc(sizeof(*tester), GFP_KERNEL);
 	if (!tester) {
 		ret = -ENOMEM;
 		goto outFreeFakeDisk;
@@ -105,6 +328,12 @@ static void *tester_init(struct nvm_tgt_dev *dev, struct gendisk **ptdisk,
 	tester->oc_channels = nr_chnls = geo->nr_chnls;
 	tester->nr_luns = geo->nr_luns;
 	tester->nr_planes = geo->nr_planes;
+	tester->nr_blks = geo->nr_chks;
+	tester->pgs_per_blk = geo->sec_per_chk/(geo->sec_per_pg * geo->nr_planes);
+	tester->sec_per_page = geo->sec_per_pg;
+	tester->plane_mode = geo->plane_mode;
+	tester->status_size = sizeof(struct ocbwt_global_status) +
+									nr_chnls * sizeof(struct ocbwt_pch_status);
 
 	tester_print_geo(geo);
 
@@ -165,9 +394,15 @@ static void tester_exit(void *private)
 	struct gendisk *fake_disk = tester->fake_disk;
 
 	remove_proc_entry("ocbwt", NULL);
+	global_tester = NULL;
 
 	for (i = 0; i < chnls; i++)
 		kthread_stop(tester->pwi[i].writer_ts);
+
+	for (i = 0; i < chnls; i++) {
+		while (0 != atomic_read(&tester->pwi[i].inflight_requests))
+			schedule();
+	}
 
 	kfree(tester);
 	kfree(fake_disk);
