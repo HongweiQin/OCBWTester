@@ -1,0 +1,3 @@
+*.ko
+.cache.mk
+Module.symvers
