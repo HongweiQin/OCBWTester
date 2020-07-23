@@ -8,11 +8,15 @@ make
 
 ## Usage
 
+```
+./install
+```
+
 ### Run Tester
 
 ```
-./install
-./gotest
+./gowrite
+./goread
 ```
 
 ### Run monitor

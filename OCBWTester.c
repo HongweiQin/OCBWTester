@@ -7,7 +7,7 @@
 #include <linux/bitmap.h>
 #include <linux/proc_fs.h>
 
-#define OCBWT_SUBMIT_QD (16)
+#define OCBWT_SUBMIT_QD (8)
 #define OCBWT_BIO_NRVEC (8)
 #define OCBWT_BIOPAGE_ALLOC_ORDER (3)
 #define OCBWT_BIOPAGE_NUM (1 << OCBWT_BIOPAGE_ALLOC_ORDER)
@@ -27,25 +27,38 @@ struct ocbwt_global_status {
 struct ocbwt_pch_status {
 	unsigned long inflight;
 	unsigned long finished;
+	unsigned long r_inflight;
+	unsigned long r_finished;
 };
 
-struct per_writer_info {
+struct per_readerwriter_info {
 	/* Writer task struct */
 	struct task_struct *writer_ts;
+	struct task_struct *reader_ts;
 
 	/* Parameters for writers. */
 	struct ocbw_tester *ocbwt;
 	unsigned int writer_index;
-	volatile int running_state;
+	volatile int writer_running_state;
+	volatile int reader_running_state;
 
 	/* Variables that used by the writer. */
 	atomic64_t finish_counter;
 	atomic_t inflight_requests;
-	int c_lun;
-	int c_pln;
-	int c_blk;
-	int c_pg;
-	int c_sec;
+	atomic64_t r_finish_counter;
+	atomic_t r_inflight_requests;
+
+	int wc_lun;
+	int wc_pln;
+	int wc_blk;
+	int wc_pg;
+	int wc_sec;
+
+	int rc_lun;
+	int rc_pln;
+	int rc_blk;
+	int rc_pg;
+	int rc_sec;
 };
 
 struct ocbw_tester {
@@ -58,53 +71,83 @@ struct ocbw_tester {
 	int pgs_per_blk;
 	int sec_per_page;
 	int plane_mode;
-	struct per_writer_info *pwi;
+	struct per_readerwriter_info *pwi;
 	unsigned int status_size;
 };
 
 struct ocbw_tester *global_tester;
 
 static struct ppa_addr ocbwt_calculate_ppa(struct ocbw_tester *tester,
-									struct per_writer_info *wi)
+									struct per_readerwriter_info *wi, int isWrite)
 {
 	struct ppa_addr ppa = {.ppa=0};
 
-	ppa.g.blk = wi->c_blk;
-	ppa.g.pg = wi->c_pg;
-	ppa.g.sec = wi->c_sec;
-	ppa.g.pl = wi->c_pln;
-	ppa.g.lun = wi->c_lun;
-	ppa.g.ch = wi->writer_index;
+	if (isWrite) {
+		ppa.g.blk = wi->wc_blk;
+		ppa.g.pg = wi->wc_pg;
+		ppa.g.sec = wi->wc_sec;
+		ppa.g.pl = wi->wc_pln;
+		ppa.g.lun = wi->wc_lun;
+		ppa.g.ch = wi->writer_index;
 
-	wi->c_sec++;
-	if (wi->c_sec == tester->sec_per_page) {
-		wi->c_sec = 0;
-		wi->c_pln++;
-		if (wi->c_pln == tester->nr_planes) {
-			wi->c_pln = 0;
-			wi->c_lun++;
-			if (wi->c_lun == tester->nr_luns) {
-				wi->c_lun = 0;
-				wi->c_pg++;
-				if (wi->c_pg == tester->pgs_per_blk) {
-					wi->c_pg = 0;
-					wi->c_blk++;
-					if (wi->c_blk == tester->nr_blks)
-						wi->c_blk = 0;
+		wi->wc_sec++;
+		if (wi->wc_sec == tester->sec_per_page) {
+			wi->wc_sec = 0;
+			wi->wc_pln++;
+			if (wi->wc_pln == tester->nr_planes) {
+				wi->wc_pln = 0;
+				wi->wc_lun++;
+				if (wi->wc_lun == tester->nr_luns) {
+					wi->wc_lun = 0;
+					wi->wc_pg++;
+					if (wi->wc_pg == tester->pgs_per_blk) {
+						wi->wc_pg = 0;
+						wi->wc_blk++;
+						if (wi->wc_blk == tester->nr_blks)
+							wi->wc_blk = 0;
+					}
+				}
+			}
+		}
+	}else {
+		ppa.g.blk = wi->rc_blk;
+		ppa.g.pg = wi->rc_pg;
+		ppa.g.sec = wi->rc_sec;
+		ppa.g.pl = wi->rc_pln;
+		ppa.g.lun = wi->rc_lun;
+		ppa.g.ch = wi->writer_index;
+
+		wi->rc_sec++;
+		if (wi->rc_sec == tester->sec_per_page) {
+			wi->rc_sec = 0;
+			wi->rc_pln++;
+			if (wi->rc_pln == tester->nr_planes) {
+				wi->rc_pln = 0;
+				wi->rc_lun++;
+				if (wi->rc_lun == tester->nr_luns) {
+					wi->rc_lun = 0;
+					wi->rc_pg++;
+					if (wi->rc_pg == tester->pgs_per_blk) {
+						wi->rc_pg = 0;
+						wi->rc_blk++;
+						if (wi->rc_blk == tester->nr_blks)
+							wi->rc_blk = 0;
+					}
 				}
 			}
 		}
 	}
+	
 	return ppa;
 }
 
 static void ocbwt_end_io_write(struct nvm_rq *rqd)
 {
-	struct per_writer_info *wi = rqd->private;
+	struct per_readerwriter_info *wi = rqd->private;
 	struct bio *bio = rqd->bio;
 
 	if (rqd->error) {
-		pr_err("Write error\n");
+		pr_err("Write error %d\n", rqd->error);
 	}
 
 	//pr_notice("Finish rqd wi %u\n", wi->writer_index);
@@ -117,7 +160,103 @@ static void ocbwt_end_io_write(struct nvm_rq *rqd)
 	bio_put(bio);
 }
 
-static int ocbwt_issue_write_nowait(struct per_writer_info *wi)
+static void ocbwt_end_io_read(struct nvm_rq *rqd)
+{
+	struct per_readerwriter_info *rwi = rqd->private;
+	struct bio *bio = rqd->bio;
+
+	if (rqd->error) {
+		if (rqd->error != NVM_RSP_ERR_EMPTYPAGE)
+			pr_err("Read error %d\n", rqd->error);
+	}
+
+	//pr_notice("Finish rqd wi %u\n", wi->writer_index);
+	atomic64_inc(&rwi->r_finish_counter);
+	atomic_dec(&rwi->r_inflight_requests);
+
+	nvm_dev_dma_free(rwi->ocbwt->dev->parent, rqd->meta_list, rqd->dma_meta_list);
+	kfree(rqd);
+	__free_pages(bio_first_page_all(bio), OCBWT_BIOPAGE_ALLOC_ORDER);
+	bio_put(bio);
+}
+
+
+static int ocbwt_issue_read_nowait(struct per_readerwriter_info *rwi)
+{
+	struct nvm_rq *rqd;
+	struct bio *bio;
+	int ret;
+	struct page *pages;
+	int i;
+	unsigned long pfn;
+	struct page *page;
+	struct ocbw_tester *tester = rwi->ocbwt;
+
+	bio = bio_alloc(GFP_ATOMIC, OCBWT_BIO_NRVEC);
+	if (!bio)
+		return -ENOMEM;
+
+	bio->bi_iter.bi_sector = 0; /* internal bio */
+	bio_set_op_attrs(bio, REQ_OP_READ, 0);
+
+	pages = alloc_pages(GFP_ATOMIC, OCBWT_BIOPAGE_ALLOC_ORDER);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto outPutBIO;
+	}
+		
+	pfn = page_to_pfn(pages);
+	for (i = 0; i < OCBWT_BIOPAGE_NUM; i++) {
+		page = pfn_to_page(pfn);
+		bio_add_page(bio, page, PAGE_SIZE, 0);
+		pfn++;
+	}
+
+	rqd = kmalloc(sizeof(*rqd), GFP_ATOMIC);
+	if (unlikely(!rqd)) {
+		ret = -ENOMEM;
+		goto outFreePages;
+	}
+
+	rqd->bio = bio;
+	rqd->dev = tester->dev;
+	rqd->opcode = NVM_OP_PREAD;
+	rqd->nr_ppas = OCBWT_BIOPAGE_NUM;
+	rqd->flags = tester->plane_mode >> 1 | NVM_IO_SUSPEND | NVM_IO_SCRAMBLE_ENABLE;
+
+	rqd->private = rwi;
+	rqd->end_io = ocbwt_end_io_read;
+
+	rqd->meta_list = nvm_dev_dma_alloc(tester->dev->parent, GFP_ATOMIC,
+							&rqd->dma_meta_list);
+	if (!rqd->meta_list) {
+		ret = -ENOMEM;
+		goto outFreeRQD;
+	}
+
+	rqd->ppa_list = rqd->meta_list + ocmbt_dma_meta_size;
+	rqd->dma_ppa_list = rqd->dma_meta_list + ocmbt_dma_meta_size;
+	rqd->ppa_status = rqd->error = 0;
+
+	for (i = 0; i < OCBWT_BIOPAGE_NUM; i++)
+		rqd->ppa_list[i] = ocbwt_calculate_ppa(tester, rwi, 0);
+
+	//pr_notice("%s, ch[%u] ppa=0x%llx\n",
+	//		__func__, wi->writer_index, rqd->ppa_list[0].ppa);
+
+	return nvm_submit_io(tester->dev, rqd);
+
+	nvm_dev_dma_free(tester->dev->parent, rqd->meta_list, rqd->dma_meta_list);
+outFreeRQD:
+	kfree(rqd);
+outFreePages:
+	__free_pages(pages, OCBWT_BIOPAGE_ALLOC_ORDER);
+outPutBIO:
+	bio_put(bio);
+	return ret;
+}
+
+static int ocbwt_issue_write_nowait(struct per_readerwriter_info *wi)
 {
 	struct nvm_rq *rqd;
 	struct bio *bio;
@@ -175,7 +314,7 @@ static int ocbwt_issue_write_nowait(struct per_writer_info *wi)
 	rqd->ppa_status = rqd->error = 0;
 
 	for (i = 0; i < OCBWT_BIOPAGE_NUM; i++)
-		rqd->ppa_list[i] = ocbwt_calculate_ppa(tester, wi);
+		rqd->ppa_list[i] = ocbwt_calculate_ppa(tester, wi, 1);
 
 	//pr_notice("%s, ch[%u] ppa=0x%llx\n",
 	//		__func__, wi->writer_index, rqd->ppa_list[0].ppa);
@@ -194,13 +333,13 @@ outPutBIO:
 
 static int ocbwt_writer_fn(void *data)
 {
-	struct per_writer_info *wi = data;
+	struct per_readerwriter_info *wi = data;
 
 	atomic64_set(&wi->finish_counter, 0);
 	atomic_set(&wi->inflight_requests, 0);
-	wi->c_blk = wi->c_lun = wi->c_pg = wi->c_pln = wi->c_sec = 0;
+	wi->wc_blk = wi->wc_lun = wi->wc_pg = wi->wc_pln = wi->wc_sec = 0;
 	//pr_notice("Writer %u initialized\n", wi->writer_index);
-	smp_store_release(&wi->running_state, OCBWT_INITIALIZED);
+	smp_store_release(&wi->writer_running_state, OCBWT_INITIALIZED);
 	set_current_state(TASK_INTERRUPTIBLE);
 	schedule();
 
@@ -214,6 +353,29 @@ static int ocbwt_writer_fn(void *data)
 	return 0;
 }
 
+static int ocbwt_reader_fn(void *data)
+{
+	struct per_readerwriter_info *rwi = data;
+
+	atomic64_set(&rwi->r_finish_counter, 0);
+	atomic_set(&rwi->r_inflight_requests, 0);
+	rwi->rc_blk = rwi->rc_lun = rwi->rc_pg = rwi->rc_pln = rwi->rc_sec = 0;
+	smp_store_release(&rwi->reader_running_state, OCBWT_INITIALIZED);
+	set_current_state(TASK_INTERRUPTIBLE);
+	schedule();
+
+	while (!kthread_should_stop()) {
+		if (atomic_add_unless(&rwi->r_inflight_requests, 1, OCBWT_SUBMIT_QD))
+			ocbwt_issue_read_nowait(rwi);
+		else
+			schedule();
+	}
+	//pr_notice("Writer %u exit\n", wi->writer_index);
+	return 0;
+}
+
+
+
 static ssize_t ocbwt_proc_write(struct file *file,
 						const char __user *buffer,
 						size_t count, loff_t *ppos)
@@ -226,9 +388,13 @@ static ssize_t ocbwt_proc_write(struct file *file,
 
 	ret = copy_from_user(usrCommand, buffer, count);
 	switch(usrCommand[0]) {
-	case 'g':
+	case 'w':
 		for (i = 0; i < nr_chnls; i++)
 			wake_up_process(tester->pwi[i].writer_ts);
+		break;
+	case 'r':
+		for (i = 0; i < nr_chnls; i++)
+			wake_up_process(tester->pwi[i].reader_ts);
 		break;
 	}
 
@@ -241,7 +407,7 @@ static void ocbwt_fill_status(struct ocbw_tester *tester, void *ocbwt_status)
 	struct ocbwt_pch_status *ch_array = ocbwt_status + sizeof(struct ocbwt_global_status);
 	struct ocbwt_pch_status *cs;
 	unsigned int i, nr_chnls;
-	struct per_writer_info *wi;
+	struct per_readerwriter_info *wi;
 
 	nr_chnls = gs->nr_chnls = tester->oc_channels;
 	for (i = 0; i < nr_chnls; i++) {
@@ -249,6 +415,8 @@ static void ocbwt_fill_status(struct ocbw_tester *tester, void *ocbwt_status)
 		wi = &tester->pwi[i];
 		cs->finished = atomic64_read(&wi->finish_counter);
 		cs->inflight = atomic_read(&wi->inflight_requests);
+		cs->r_finished = atomic64_read(&wi->r_finish_counter);
+		cs->r_inflight = atomic_read(&wi->r_inflight_requests);
 	}
 }
 
@@ -307,7 +475,7 @@ static void *tester_init(struct nvm_tgt_dev *dev, struct gendisk **ptdisk,
 	struct nvm_geo *geo = &dev->geo;
 	int ret;
 	unsigned int nr_chnls;
-	struct per_writer_info *wi;
+	struct per_readerwriter_info *wi;
 	char tsname[32];
 	struct gendisk *fake_disk;
 
@@ -347,21 +515,34 @@ static void *tester_init(struct nvm_tgt_dev *dev, struct gendisk **ptdisk,
 		wi = &tester->pwi[i];
 		wi->ocbwt = tester;
 		wi->writer_index = i;
-		wi->running_state = OCBWT_UNINITIALIZED;
+		wi->reader_running_state =
+			wi->writer_running_state =
+					OCBWT_UNINITIALIZED;
 
-		sprintf(tsname, "ocbwt_%u", i);
+		sprintf(tsname, "ocbwt_w_%u", i);
 		wi->writer_ts = kthread_create(ocbwt_writer_fn, wi, tsname);
 		if (IS_ERR(wi->writer_ts)) {
 			ret = -ENOMEM;
-			goto outFreeWriters;
+			goto outFreeReaderWriters;
+		}
+
+		sprintf(tsname, "ocbwt_r_%u", i);
+		wi->reader_ts = kthread_create(ocbwt_reader_fn, wi, tsname);
+		if (IS_ERR(wi->reader_ts)) {
+			ret = -ENOMEM;
+			goto outFreeReaderWriters;
 		}
 	}
 	barrier();
-	for (i = 0; i < nr_chnls; i++)
+	for (i = 0; i < nr_chnls; i++) {
 		wake_up_process(tester->pwi[i].writer_ts);
+		wake_up_process(tester->pwi[i].reader_ts);
+	}
 	for (i = 0; i < nr_chnls; i++) {
 		wi = &tester->pwi[i];
-		while (OCBWT_INITIALIZED != READ_ONCE(wi->running_state))
+		while (OCBWT_INITIALIZED != READ_ONCE(wi->writer_running_state))
+			schedule();
+		while (OCBWT_INITIALIZED != READ_ONCE(wi->reader_running_state))
 			schedule();
 	}
 
@@ -374,10 +555,13 @@ static void *tester_init(struct nvm_tgt_dev *dev, struct gendisk **ptdisk,
 	return tester;
 
 	remove_proc_entry("ocbwt", NULL);
-outFreeWriters:
+outFreeReaderWriters:
 	for (i = 0; i < nr_chnls; i++) {
 		wi = &tester->pwi[i];
-		kthread_stop(wi->writer_ts);
+		if (wi->writer_ts && !IS_ERR(wi->writer_ts))
+			kthread_stop(wi->writer_ts);
+		if (wi->reader_ts && !IS_ERR(wi->reader_ts))
+			kthread_stop(wi->reader_ts);
 	}
 outFreeTester:
 	kfree(tester);
@@ -396,11 +580,15 @@ static void tester_exit(void *private)
 	remove_proc_entry("ocbwt", NULL);
 	global_tester = NULL;
 
-	for (i = 0; i < chnls; i++)
+	for (i = 0; i < chnls; i++) {
 		kthread_stop(tester->pwi[i].writer_ts);
+		kthread_stop(tester->pwi[i].reader_ts);
+	}
 
 	for (i = 0; i < chnls; i++) {
 		while (0 != atomic_read(&tester->pwi[i].inflight_requests))
+			schedule();
+		while (0 != atomic_read(&tester->pwi[i].r_inflight_requests))
 			schedule();
 	}
 

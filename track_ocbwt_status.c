@@ -5,7 +5,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#define READ_SIZE (4096)
+#define READ_SIZE (8192)
 
 struct ocbwt_global_status {
 	unsigned long nr_chnls;
@@ -14,6 +14,8 @@ struct ocbwt_global_status {
 struct ocbwt_pch_status {
 	unsigned long inflight;
 	unsigned long finished;
+	unsigned long r_inflight;
+	unsigned long r_finished;
 };
 
 
@@ -31,7 +33,9 @@ int main(int argc, char **argv)
 	int testCount = 5;
 	unsigned long saved[32];
 	unsigned long first[32];
-	unsigned long total;
+	unsigned long rsaved[32];
+	unsigned long rfirst[32];
+	unsigned long total, rtotal;
 
 	if (argc == 2) {
 		testCount = atoi(argv[1]);
@@ -59,15 +63,22 @@ int main(int argc, char **argv)
 
 		for (i = 0; i < nr_chnl; i++) {
 			unsigned long finished, inflight;
-			unsigned long pulse;
+			unsigned long rfinished, rinflight;
+			unsigned long pulse, rpulse;
 
 			finished = cs_array[i].finished;
 			inflight = cs_array[i].inflight;
+			rfinished = cs_array[i].r_finished;
+			rinflight = cs_array[i].r_inflight;
 			pulse = finished - saved[i];
-			printf("[%lu %lu]", pulse, inflight);
+			rpulse = rfinished - rsaved[i];
+			printf("[%lu %lu %lu %lu]", pulse, rpulse, inflight, rinflight);
 			saved[i] = finished;
-			if (!k)
+			rsaved[i] = rfinished;
+			if (!k) {
 				first[i] = finished;
+				rfirst[i] = rfinished;
+			}
 		}
 		printf("\n");
 
@@ -75,12 +86,13 @@ int main(int argc, char **argv)
 		usleep(500000);
 	}
 
-	total = 0;
+	total = rtotal = 0;
 	for (i = 0; i < nr_chnl; i++) {
-		printf("<%lu>", saved[i] - first[i]);
+		printf("<w %lu r %lu>", saved[i] - first[i], rsaved[i] - rfirst[i]);
 		total += saved[i] - first[i];
+		rtotal += rsaved[i] - rfirst[i];
 	}
-	printf("\ntotal=%lu\n", total);
+	printf("\nw_total=%lu r_total=%lu\n", total, rtotal);
 	close(fd);
 out:
 	free(buf);
