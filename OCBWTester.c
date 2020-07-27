@@ -244,8 +244,11 @@ static int ocbwt_issue_read_nowait(struct per_readerwriter_info *rwi)
 	//pr_notice("%s, ch[%u] ppa=0x%llx\n",
 	//		__func__, wi->writer_index, rqd->ppa_list[0].ppa);
 
-	return nvm_submit_io(tester->dev, rqd);
-
+	ret = nvm_submit_io_nowait(tester->dev, rqd);
+	if (ret)
+		goto submit_err_out;
+	return ret;
+submit_err_out:
 	nvm_dev_dma_free(tester->dev->parent, rqd->meta_list, rqd->dma_meta_list);
 outFreeRQD:
 	kfree(rqd);
@@ -319,8 +322,12 @@ static int ocbwt_issue_write_nowait(struct per_readerwriter_info *wi)
 	//pr_notice("%s, ch[%u] ppa=0x%llx\n",
 	//		__func__, wi->writer_index, rqd->ppa_list[0].ppa);
 
-	return nvm_submit_io(tester->dev, rqd);
+	ret = nvm_submit_io_nowait(tester->dev, rqd);
+	if (ret)
+		goto submit_err_out;
+	return ret;
 
+submit_err_out:
 	nvm_dev_dma_free(tester->dev->parent, rqd->meta_list, rqd->dma_meta_list);
 outFreeRQD:
 	kfree(rqd);
@@ -334,6 +341,7 @@ outPutBIO:
 static int ocbwt_writer_fn(void *data)
 {
 	struct per_readerwriter_info *wi = data;
+	int ret;
 
 	atomic64_set(&wi->finish_counter, 0);
 	atomic_set(&wi->inflight_requests, 0);
@@ -344,10 +352,13 @@ static int ocbwt_writer_fn(void *data)
 	schedule();
 
 	while (!kthread_should_stop()) {
-		if (atomic_add_unless(&wi->inflight_requests, 1, OCBWT_SUBMIT_QD))
-			ocbwt_issue_write_nowait(wi);
-		else
+		if (atomic_add_unless(&wi->inflight_requests, 1, OCBWT_SUBMIT_QD)) {
+			ret = ocbwt_issue_write_nowait(wi);
+			if (ret)
+				atomic_dec(&wi->inflight_requests);
+		} else {
 			schedule();
+		}
 	}
 	//pr_notice("Writer %u exit\n", wi->writer_index);
 	return 0;
@@ -356,6 +367,7 @@ static int ocbwt_writer_fn(void *data)
 static int ocbwt_reader_fn(void *data)
 {
 	struct per_readerwriter_info *rwi = data;
+	int ret;
 
 	atomic64_set(&rwi->r_finish_counter, 0);
 	atomic_set(&rwi->r_inflight_requests, 0);
@@ -365,10 +377,13 @@ static int ocbwt_reader_fn(void *data)
 	schedule();
 
 	while (!kthread_should_stop()) {
-		if (atomic_add_unless(&rwi->r_inflight_requests, 1, OCBWT_SUBMIT_QD))
-			ocbwt_issue_read_nowait(rwi);
-		else
+		if (atomic_add_unless(&rwi->r_inflight_requests, 1, OCBWT_SUBMIT_QD)) {
+			ret = ocbwt_issue_read_nowait(rwi);
+			if (ret)
+				atomic_dec(&rwi->r_inflight_requests);
+		} else {
 			schedule();
+		}
 	}
 	//pr_notice("Writer %u exit\n", wi->writer_index);
 	return 0;
