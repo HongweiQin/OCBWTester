@@ -1,0 +1,5 @@
+#!/bin/bash
+
+insmod ocbwt.ko
+nvme lnvm create -d nvme0n1 -b 0 -e 127 -n ocbwt_dev -t ocbwt
+

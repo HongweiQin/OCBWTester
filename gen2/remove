@@ -1,0 +1,4 @@
+#!/bin/bash
+
+nvme lnvm remove -n ocbwt_dev
+rmmod ocbwt
