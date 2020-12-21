@@ -11,6 +11,9 @@
 #define OCBWT_BIO_NRVEC (8)
 #define OCBWT_BIOPAGE_ALLOC_ORDER (3)
 #define OCBWT_BIOPAGE_NUM (1 << OCBWT_BIOPAGE_ALLOC_ORDER)
+#define OCBWT_WRITE_BIOPAGE_ALLOC_ORDER (3)
+#define OCBWT_WRITE_BIOPAGE_NUM (1 << OCBWT_WRITE_BIOPAGE_ALLOC_ORDER)
+
 
 enum {
 	OCBWT_UNINITIALIZED = 0,
@@ -56,6 +59,9 @@ struct per_readerwriter_info {
 
 	/* Pre-allocated read requests */
 	struct ocbwt_r_ctx *rctx;
+
+	/* Per-channel dma pool */
+	void *pch_dma_pool;
 
 	int wc_lun;
 	int wc_pln;
@@ -163,7 +169,8 @@ static void ocbwt_end_io_write(struct nvm_rq *rqd)
 	atomic64_inc(&wi->finish_counter);
 	atomic_dec(&wi->inflight_requests);
 
-	nvm_dev_dma_free(wi->ocbwt->dev->parent, rqd->meta_list, rqd->dma_meta_list);
+	wi->ocbwt->dev->parent->ops->dev_dma_free(wi->pch_dma_pool,
+					rqd->meta_list, rqd->dma_meta_list);
 	kfree(rqd);
 	__free_pages(bio_first_page_all(bio), OCBWT_BIOPAGE_ALLOC_ORDER);
 	bio_put(bio);
@@ -242,7 +249,7 @@ static int ocbwt_issue_write_nowait(struct per_readerwriter_info *wi)
 	}
 		
 	pfn = page_to_pfn(pages);
-	for (i = 0; i < OCBWT_BIOPAGE_NUM; i++) {
+	for (i = 0; i < OCBWT_WRITE_BIOPAGE_NUM; i++) {
 		page = pfn_to_page(pfn);
 		bio_add_page(bio, page, PAGE_SIZE, 0);
 		pfn++;
@@ -257,14 +264,14 @@ static int ocbwt_issue_write_nowait(struct per_readerwriter_info *wi)
 	rqd->bio = bio;
 	rqd->dev = tester->dev;
 	rqd->opcode = NVM_OP_PWRITE;
-	rqd->nr_ppas = OCBWT_BIOPAGE_NUM;
+	rqd->nr_ppas = OCBWT_WRITE_BIOPAGE_NUM;
 	rqd->flags = (tester->plane_mode >> 1) | NVM_IO_SCRAMBLE_ENABLE;
 
 	rqd->private = wi;
 	rqd->end_io = ocbwt_end_io_write;
 
-	rqd->meta_list = nvm_dev_dma_alloc(tester->dev->parent, GFP_ATOMIC,
-							&rqd->dma_meta_list);
+	rqd->meta_list = tester->dev->parent->ops->dev_dma_alloc(tester->dev->parent,
+					wi->pch_dma_pool, GFP_KERNEL, &rqd->dma_meta_list);
 	if (!rqd->meta_list) {
 		ret = -ENOMEM;
 		goto outFreeRQD;
@@ -274,7 +281,7 @@ static int ocbwt_issue_write_nowait(struct per_readerwriter_info *wi)
 	rqd->dma_ppa_list = rqd->dma_meta_list + ocmbt_dma_meta_size;
 	rqd->ppa_status = rqd->error = 0;
 
-	for (i = 0; i < OCBWT_BIOPAGE_NUM; i++)
+	for (i = 0; i < OCBWT_WRITE_BIOPAGE_NUM; i++)
 		rqd->ppa_list[i] = ocbwt_calculate_ppa(tester, wi, 1);
 
 	//pr_notice("%s, ch[%u] ppa=0x%llx\n",
@@ -286,7 +293,8 @@ static int ocbwt_issue_write_nowait(struct per_readerwriter_info *wi)
 	return ret;
 
 submit_err_out:
-	nvm_dev_dma_free(tester->dev->parent, rqd->meta_list, rqd->dma_meta_list);
+	tester->dev->parent->ops->dev_dma_free(wi->pch_dma_pool,
+					rqd->meta_list, rqd->dma_meta_list);
 outFreeRQD:
 	kfree(rqd);
 outFreePages:
@@ -362,8 +370,8 @@ static int ocbwt_reader_fn(void *data)
 		}
 
 		rqd->bio = bio;
-		rqd->meta_list = nvm_dev_dma_alloc(tester->dev->parent, GFP_KERNEL,
-							&rqd->dma_meta_list);
+		rqd->meta_list = tester->dev->parent->ops->dev_dma_alloc(tester->dev->parent, rwi->pch_dma_pool,
+				    GFP_KERNEL, &rqd->dma_meta_list);
 		if (!rqd->meta_list) {
 			pr_err("%s, can't allocate meta_list\n", __func__);
 			ret = -ENOMEM;
@@ -411,7 +419,8 @@ retry:
 
 		__free_pages(rctx->pages, OCBWT_BIOPAGE_ALLOC_ORDER);
 		bio_put(rctx->bio);
-		nvm_dev_dma_free(tester->dev->parent, rqd->meta_list, rqd->dma_meta_list);
+		tester->dev->parent->ops->dev_dma_free(rwi->pch_dma_pool,
+					rqd->meta_list, rqd->dma_meta_list);
 	}
 errout2:
 	kfree(rwi->rctx);
@@ -561,6 +570,12 @@ static void *tester_init(struct nvm_tgt_dev *dev, struct gendisk **ptdisk,
 			wi->writer_running_state =
 					OCBWT_UNINITIALIZED;
 
+		wi->pch_dma_pool = dev->parent->ops->create_dma_pool(dev->parent, tsname);
+		if (!wi->pch_dma_pool) {
+			ret = -ENOMEM;
+			goto outFreeReaderWriters;
+		}
+
 		sprintf(tsname, "ocbwt_w_%u", i);
 		wi->writer_ts = kthread_create(ocbwt_writer_fn, wi, tsname);
 		if (IS_ERR(wi->writer_ts)) {
@@ -574,6 +589,7 @@ static void *tester_init(struct nvm_tgt_dev *dev, struct gendisk **ptdisk,
 			ret = -ENOMEM;
 			goto outFreeReaderWriters;
 		}
+		
 	}
 	barrier();
 	for (i = 0; i < nr_chnls; i++) {
@@ -604,6 +620,8 @@ outFreeReaderWriters:
 			kthread_stop(wi->writer_ts);
 		if (wi->reader_ts && !IS_ERR(wi->reader_ts))
 			kthread_stop(wi->reader_ts);
+		if (wi->pch_dma_pool)
+			dev->parent->ops->destroy_dma_pool(wi->pch_dma_pool);
 	}
 outFreeTester:
 	kfree(tester);
@@ -630,6 +648,11 @@ static void tester_exit(void *private)
 	for (i = 0; i < chnls; i++) {
 		while (0 != atomic_read(&tester->pwi[i].inflight_requests))
 			schedule();
+
+		/* It's save to destroy the per channel dma pools
+		 * after all requests to the channel are finished.
+		 */
+		tester->dev->parent->ops->destroy_dma_pool(tester->pwi[i].pch_dma_pool);
 	}
 
 	kfree(tester);
